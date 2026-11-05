@@ -1,0 +1,9 @@
+name: astrbot_plugin_personal_todo
+display_name: 私人待办提醒
+desc: QQ 私聊中的文字与图片待办提取、重要性标记、截止提醒和每日汇总。
+version: v0.1.0
+author: Personal Todo contributors
+repo: ""
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.5.7"
