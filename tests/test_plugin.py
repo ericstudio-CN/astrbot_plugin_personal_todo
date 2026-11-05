@@ -78,6 +78,8 @@ def load_adapter():
     modules["astrbot.api.event"].filter = types.SimpleNamespace(
         command=unchanged_decorator,
         event_message_type=unchanged_decorator,
+        on_llm_request=unchanged_decorator,
+        llm_tool=unchanged_decorator,
         EventMessageType=types.SimpleNamespace(PRIVATE_MESSAGE="private-message"),
     )
     modules["astrbot.api.star"].Context = object
@@ -170,7 +172,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             ),
             send_message=AsyncMock(return_value=True),
         )
-        self.config = {"owner_qq": "123", "daily_summary_enabled": False}
+        self.config = {
+            "owner_qq": "123",
+            "daily_summary_enabled": False,
+            "conversational_mode": False,
+        }
         self.plugin = adapter.PersonalTodoPlugin(self.context, self.config)
         self.plugin.store = adapter.TaskStore(self.path)
         self.plugin.client = types.SimpleNamespace(aclose=AsyncMock())
@@ -351,7 +357,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_reports_version_and_auto_default_for_existing_config(self):
         result = await self.command("/待办 状态")
-        self.assertIn("v0.2.0", result)
+        self.assertIn("v0.3.0", result)
         self.assertIn("私聊自动识别：开启", result)
 
     def add_due_task(

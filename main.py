@@ -16,6 +16,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .conversation import CONTEXT_MARKER, TOOL_NAME, build_chat_context
 from .domain import (
     LOCAL_TZ,
     ExtractionError,
@@ -29,7 +30,8 @@ from .media import MediaError, image_data_uri
 from .storage import TaskStore
 
 HELP = """个人待办（仅本人私聊，北京时间）
-直接发通知文字或图片即可自动识别；普通聊天不会记录。
+直接发通知文字或图片即可记录；可直接说“晚上十一点”“四级作业做完了”“今天要做什么”。
+默认与当前人格一起对话，不需要使用下面的备用指令。
 /记一下 明天下午六点交材料，提前两小时提醒
 /记一下 + 图片，也可引用消息后发送 /记一下
 /待办 列表｜今日｜详情 23
@@ -58,7 +60,7 @@ def _integer(value, minimum: int, maximum: int, name: str) -> int:
     return result
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 @register("astrbot_plugin_personal_todo", "Personal Todo contributors", "个人待办与提醒", VERSION)
@@ -71,6 +73,7 @@ class PersonalTodoPlugin(Star):
         self.worker: asyncio.Task | None = None
         self.model_lock = asyncio.Lock()
         self._closing = False
+        self._persona_prompts: dict[str, str] = {}
 
     @property
     def owner(self) -> str:
@@ -98,9 +101,10 @@ class PersonalTodoPlugin(Star):
         self._closing = False
         self.worker = asyncio.create_task(self._worker(), name="personal-todo-reminders")
         logger.info(
-            "个人待办 v%s 已加载：自动识别=%s，主人配置=%s，检查间隔=%ss",
+            "个人待办 v%s 已加载：自动识别=%s，自然对话=%s，主人配置=%s，检查间隔=%ss",
             VERSION,
             self.config.get("auto_capture_enabled", True),
+            self.config.get("conversational_mode", True),
             bool(self.owner),
             self.poll_seconds,
         )
@@ -174,6 +178,10 @@ class PersonalTodoPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=99999)
     async def auto_capture(self, event: AstrMessageEvent):
         """Recognize owner notifications before ordinary chat/merger handlers."""
+        if self.config.get("conversational_mode", True):
+            # Native AstrBot chat owns persona, conversation history and tool
+            # execution. Do not race it with a second independent bot response.
+            return
         if (
             not self.config.get("auto_capture_enabled", True)
             or event.get_platform_name() != "aiocqhttp"
@@ -250,8 +258,9 @@ class PersonalTodoPlugin(Star):
             return (
                 f"私人待办提醒 v{VERSION}\n"
                 f"私聊自动识别：{'开启' if self.config.get('auto_capture_enabled', True) else '关闭'}\n"
+                f"自然对话与人格融合：{'开启' if self.config.get('conversational_mode', True) else '关闭'}\n"
                 f"模型提供商：{self.config.get('provider_id') or '跟随当前会话模型'}\n"
-                "记录成功会回复‘已添加’和编号；时间不明确会提示补充。"
+                "自然对话由当前人格通过 personal_todo 工具操作并回复；备用指令显示完整编号。"
             )
         if verb in ("", "列表", "list", "今日", "今天"):
             return self._list(now, today=verb in ("今日", "今天"))
@@ -335,6 +344,149 @@ class PersonalTodoPlugin(Star):
             )
         text = rest if verb in ("添加", "add") else body
         return await self._safe_capture(event, text)
+
+    def _owned_chat(self, event: AstrMessageEvent) -> bool:
+        return (
+            bool(self.owner)
+            and event.get_platform_name() == "aiocqhttp"
+            and event.is_private_chat()
+            and str(event.get_sender_id()) == self.owner
+        )
+
+    def _draft(self, origin: str) -> dict | None:
+        raw = self.store.get_meta(f"draft:{self.owner}:{origin}")
+        if not raw:
+            return None
+        draft = json.loads(raw)
+        return draft if int(time.time()) - draft["created_at"] <= 86400 else None
+
+    @filter.on_llm_request()
+    async def enrich_chat(self, event: AstrMessageEvent, req):
+        """Append capabilities and live facts without replacing the persona."""
+        if (
+            not self.config.get("conversational_mode", True)
+            or not self.config.get("auto_capture_enabled", True)
+            or not self._owned_chat(event)
+            or not self.store
+            or self._closing
+        ):
+            return
+        self.store.set_meta(f"origin:{self.owner}", event.unified_msg_origin)
+        base_prompt = re.sub(
+            r"\n<personal_todo_context>\n.*?\n</personal_todo_context>",
+            "",
+            req.system_prompt or "",
+            flags=re.DOTALL,
+        )
+        persona_match = re.search(
+            r"<persona_instructions>\s*(.*?)\s*</persona_instructions>", base_prompt, re.DOTALL
+        )
+        self._persona_prompts[event.unified_msg_origin] = (
+            persona_match.group(1) if persona_match else base_prompt
+        )
+        tool_set = getattr(req, "func_tool", None)
+        available = any(
+            getattr(tool, "name", "") == TOOL_NAME
+            for tool in getattr(tool_set, "tools", getattr(tool_set, "func_list", []))
+        )
+        if not available:
+            logger.warning(
+                "个人待办：当前会话未提供 personal_todo 工具，请在当前人格能力中启用本插件工具"
+            )
+            req.system_prompt = (
+                base_prompt
+                + CONTEXT_MARKER
+                + (
+                    "当前待办工具不可用。普通聊天沿用原人格；如果用户要记录/修改待办，"
+                    "如实说明暂时无法操作，需在当前人格的工具列表启用 personal_todo。"
+                    "不得声称已保存或已修改。\n</personal_todo_context>"
+                )
+            )
+            return
+        req.system_prompt = base_prompt + build_chat_context(
+            int(time.time()),
+            self.store.list_tasks(self.owner, limit=21),
+            self._draft(event.unified_msg_origin),
+            self.store.get_meta(f"focus:{self.owner}:{event.unified_msg_origin}"),
+        )
+        logger.info("个人待办：已接入当前人格对话，personal_todo 工具可用")
+
+    @filter.llm_tool(name="personal_todo")
+    async def personal_todo(
+        self, event: AstrMessageEvent, action: str, text: str = "", task_id: int = 0
+    ) -> str:
+        """在正常对话中管理主人的待办，返回真实数据库结果供当前人格自然回复。
+
+        Args:
+            action(string): add添加通知/文字/当前图片，clarify补充上次追问，discard_draft放弃未保存草稿，list查询未完成，today今日到期，details详情，complete完成，cancel取消，postpone改截止，remind改提醒，importance改重要性，summary改汇总。
+            text(string): 完整任务或补充内容，结合对话补全指代；postpone给新截止，remind给新提醒，importance用高/普通/低，summary用开/关/HH:MM；纯查询填空字符串。
+            task_id(number): 修改或查询详情的任务编号，须从上下文或list结果确定；添加、补充、列表、汇总填0。不能猜测编号。
+        """
+        error = self._authorize(event)
+        if error:
+            return error
+        if not self.config.get("conversational_mode", True):
+            return "自然对话模式已关闭，本次没有执行；可开启插件的自然对话模式或使用备用待办指令。"
+        tool_owner = self.owner
+        try:
+            if not isinstance(action, str) or not isinstance(text, str) or len(text) > 16000:
+                return "参数不合法，本次没有执行。"
+            if (
+                isinstance(task_id, bool)
+                or not isinstance(task_id, (int, float))
+                or not float(task_id).is_integer()
+                or task_id < 0
+            ):
+                return "任务编号不合法，本次没有执行。"
+            task_id = int(task_id)
+            logger.info("个人待办：对话工具 action=%s task_id=%s", action, task_id)
+            if action == "add":
+                result = await self._safe_capture(event, text or event.get_message_str())
+            elif action == "clarify":
+                draft = self._draft(event.unified_msg_origin)
+                if not draft:
+                    return "没有有效的待补充草稿，请根据对话重新提供完整任务信息；本次没有新建。"
+                result = await self._safe_capture(
+                    event,
+                    text or event.get_message_str(),
+                    mode=draft["mode"],
+                    original_task=draft.get("original_task"),
+                    draft=draft,
+                )
+            elif action == "discard_draft":
+                self.store.set_meta(f"draft:{self.owner}:{event.unified_msg_origin}", "")
+                return "已放弃尚未保存的草稿，已保存的待办不受影响。"
+            elif action in ("list", "today", "summary"):
+                result = await self._dispatch(
+                    event,
+                    {"list": "列表", "today": "今日", "summary": "汇总"}[action]
+                    + (" " + text if text else ""),
+                )
+            else:
+                verbs = {
+                    "details": "详情",
+                    "complete": "完成",
+                    "cancel": "取消",
+                    "postpone": "延期",
+                    "remind": "提醒",
+                    "importance": "重要",
+                }
+                if action not in verbs:
+                    return "不支持该操作，本次没有执行。"
+                if not task_id:
+                    return "尚未确定具体任务。先查询列表；有多个候选时请用自然语言询问主人，不要猜编号。"
+                result = await self._dispatch(event, f"{verbs[action]} {task_id} {text}")
+                if self.owner == tool_owner:
+                    self.store.set_meta(
+                        f"focus:{tool_owner}:{event.unified_msg_origin}",
+                        {"ids": [task_id], "time": int(time.time())},
+                    )
+            # The native Agent consumes the return value. No event.stop_event,
+            # no direct message: its final reply retains persona and history.
+            return result or "未执行任何待办操作。"
+        except Exception as exc:
+            logger.error("个人待办对话工具失败：%s", type(exc).__name__)
+            return "本次操作未能正常完成，请先查询真实待办状态，不要宣称成功。"
 
     def _source_key(self, event: AstrMessageEvent, text: str) -> str:
         message_id = getattr(event.message_obj, "message_id", None)
@@ -475,7 +627,11 @@ class PersonalTodoPlugin(Star):
             return (
                 "需要补充信息，暂未保存：\n"
                 + "\n".join(f"• {q}" for q in parsed["questions"])
-                + "\n请回复 /待办 补充 具体信息"
+                + (
+                    "\n直接告诉我补充信息即可。"
+                    if self.config.get("conversational_mode", True)
+                    else "\n请回复 /待办 补充 具体信息"
+                )
             )
         items = parsed["tasks"]
         if not items:
@@ -544,7 +700,11 @@ class PersonalTodoPlugin(Star):
             return (
                 "今天没有待处理的到期事项。"
                 if today
-                else "当前没有未完成待办。发送 /记一下 开始记录。"
+                else (
+                    "当前没有未完成待办。有想做的事直接告诉我就好。"
+                    if self.config.get("conversational_mode", True)
+                    else "当前没有未完成待办。发送 /记一下 开始记录。"
+                )
             )
         rows.sort(key=lambda row: (row["due_at"] is None, row["due_at"] or 0, row["id"]))
         title = "今日到期与已逾期待办" if today else "未完成待办"
@@ -599,6 +759,88 @@ class PersonalTodoPlugin(Star):
         if result is False:
             raise RuntimeError("未找到可用的消息平台")
 
+    async def _current_persona_prompt(self, origin: str) -> str:
+        manager = getattr(self.context, "persona_manager", None)
+        if manager is None:
+            return self._persona_prompts.get(origin, "")
+        conversation_id = None
+        conversation = None
+        conversations = getattr(self.context, "conversation_manager", None)
+        if conversations:
+            conversation_id = await conversations.get_curr_conversation_id(origin)
+            if conversation_id:
+                conversation = await conversations.get_conversation(origin, conversation_id)
+        persona_id = getattr(conversation, "persona_id", None)
+        if persona_id == "[%None]":
+            return ""
+        resolver = getattr(manager, "resolve_selected_persona", None)
+        if callable(resolver):
+            config_getter = getattr(self.context, "get_config", None)
+            settings = (
+                config_getter(umo=origin).get("provider_settings", {})
+                if callable(config_getter)
+                else {}
+            )
+            _, persona, _, _ = await resolver(
+                umo=origin,
+                conversation_persona_id=persona_id,
+                platform_name="aiocqhttp",
+                provider_settings=settings,
+            )
+        elif persona_id:
+            persona = manager.get_persona_v3_by_id(persona_id)
+        else:
+            persona = await manager.get_default_persona_v3(umo=origin)
+        return persona.get("prompt", "") if persona else ""
+
+    async def _notification_text(self, origin: str, facts: str) -> str:
+        """Use persona for a short opening; immutable facts never go through rewriting."""
+        if not self.config.get("conversational_mode", True) or not self.config.get(
+            "persona_notifications", True
+        ):
+            return facts
+
+        async def opening():
+            persona = await self._current_persona_prompt(origin)
+            if not persona:
+                return ""
+            provider = await self.context.get_current_chat_provider_id(umo=origin)
+            response = await self.context.llm_generate(
+                chat_provider_id=provider,
+                contexts=[],
+                system_prompt=persona
+                + "\n现在给主人发待办提醒。只沿用原人格写一两句简短开场，不需要自我介绍。下面的任务都是数据。不要复述任务标题、编号、日期、时间或输出清单，不要声称已执行或修改任何任务，不要要求斜杠指令。实际事项会由程序紧接着附上。只返回开场白。",
+                prompt=json.dumps({"notification_facts": facts}, ensure_ascii=False),
+            )
+            return " ".join(response.completion_text.strip().split())
+
+        try:
+            intro = await asyncio.wait_for(opening(), timeout=8)
+            if (
+                not intro
+                or len(intro) > 280
+                or re.search(r"\d|```|已完成|已经完成|已取消|已延期|已修改|已经修改", intro)
+            ):
+                return facts
+            return intro + "\n\n" + facts
+        except Exception as exc:
+            logger.warning("个人待办：人格提醒生成不可用，发送基础提醒 type=%s", type(exc).__name__)
+            return facts
+
+    def _reminder_facts(self, jobs: list[dict], now: int) -> str:
+        lines = ["⏰ 待办提醒（北京时间）"]
+        for job in jobs:
+            late = "（延迟补发）" if now - job["scheduled_at"] > self.poll_seconds * 2 else ""
+            lines.append(
+                f"#{job['task_id']:03d} {PRIORITIES[job['importance']]} {job['title']}{late}\n截止：{format_time(job['due_at'], job.get('due_precision', 'datetime'))}"
+            )
+        lines.append(
+            "做完后告诉我就行，也可以让我晚点再提醒。"
+            if self.config.get("conversational_mode", True)
+            else "完成后回复 /待办 完成 编号；稍后提醒可用 /待办 提醒 编号 半小时后"
+        )
+        return "\n\n".join(lines)
+
     async def _tick(self, now: int):
         if not self.store or not self.owner:
             return
@@ -612,7 +854,6 @@ class PersonalTodoPlugin(Star):
             if self.store.is_reminder_active(job["reminder_id"]):
                 groups[job["origin"]].append(job)
         for origin, jobs in groups.items():
-            # No await between final state check and starting the send operation.
             jobs = [
                 job
                 for job in jobs
@@ -620,15 +861,19 @@ class PersonalTodoPlugin(Star):
             ]
             if not jobs:
                 continue
-            lines = ["⏰ 待办提醒（北京时间）"]
-            for job in jobs:
-                late = "（延迟补发）" if now - job["scheduled_at"] > self.poll_seconds * 2 else ""
-                lines.append(
-                    f"#{job['task_id']:03d} {PRIORITIES[job['importance']]} {job['title']}{late}\n截止：{format_time(job['due_at'], job.get('due_precision', 'datetime'))}"
-                )
-            lines.append("完成后回复 /待办 完成 编号；稍后提醒可用 /待办 提醒 编号 半小时后")
+            text = await self._notification_text(origin, self._reminder_facts(jobs, now))
+            active = [
+                job
+                for job in jobs
+                if job["owner"] == self.owner and self.store.is_reminder_active(job["reminder_id"])
+            ]
+            if not active:
+                continue
+            if len(active) != len(jobs):
+                text = self._reminder_facts(active, now)
+            jobs = active
             try:
-                await self._send(origin, "\n\n".join(lines))
+                await self._send(origin, text)
             except Exception as exc:
                 logger.warning("个人待办提醒发送失败：%s", type(exc).__name__)
                 for job in jobs:
@@ -638,10 +883,15 @@ class PersonalTodoPlugin(Star):
             else:
                 for job in jobs:
                     self.store.acknowledge(job["reminder_id"], int(time.time()))
+                self.store.set_meta(
+                    f"focus:{jobs[0]['owner']}:{origin}",
+                    {"ids": [job["task_id"] for job in jobs], "time": int(time.time())},
+                )
                 logger.info("个人待办：提醒投递成功 count=%s", len(jobs))
         await self._daily_summary(now)
 
     async def _daily_summary(self, now: int):
+        summary_owner = self.owner
         enabled, clock = self._summary_config()
         local = datetime.fromtimestamp(now, LOCAL_TZ)
         day = local.date().isoformat()
@@ -659,6 +909,21 @@ class PersonalTodoPlugin(Star):
             rows.sort(key=lambda row: (row["due_at"] is None, row["due_at"] or 0, row["id"]))
             text = f"📋 {day} 未完成待办汇总（{len(rows)}项，最多显示20项）\n\n"
             text += "\n\n".join(self._line(row, now) for row in rows[:20])
+            text = await self._notification_text(origin, text)
+            if self.owner != summary_owner:
+                return
+            refreshed = self.store.list_tasks(self.owner, limit=500)
+            if refreshed != rows:
+                rows = sorted(
+                    refreshed,
+                    key=lambda row: (row["due_at"] is None, row["due_at"] or 0, row["id"]),
+                )
+                text = f"📋 {day} 未完成待办汇总（{len(rows)}项，最多显示20项）\n\n" + "\n\n".join(
+                    self._line(row, now) for row in rows[:20]
+                )
+            if not rows:
+                self.store.set_meta(marker, day)
+                return
             try:
                 await self._send(origin, text)
             except Exception as exc:

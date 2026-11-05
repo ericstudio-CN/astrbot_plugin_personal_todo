@@ -15,7 +15,19 @@
     "description": "自动识别本人私聊中的待办",
     "type": "bool",
     "default": true,
-    "hint": "直接发送通知文字或图片即可识别，无须 /记一下。普通聊天和其他插件指令不建立待办。识别到任务后由本插件回复入库结果。"
+    "hint": "直接发送通知文字或图片即可识别，无须 /记一下。自然对话模式下由当前人格调用 personal_todo 工具处理。"
+  },
+  "conversational_mode": {
+    "description": "自然对话与当前人格融合（推荐）",
+    "type": "bool",
+    "default": true,
+    "hint": "使用 AstrBot 原生聊天与工具调用，回复继承当前人格及历史。需在当前人格的工具列表允许 personal_todo。关闭可回退独立识别回执模式。"
+  },
+  "persona_notifications": {
+    "description": "提醒与每日汇总沿用当前人格语气",
+    "type": "bool",
+    "default": true,
+    "hint": "仅生成简短提醒开场，任务编号与时间仍由程序提供。模型超时或不可用时照常发送基础提醒。"
   },
   "default_lead_minutes": {
     "description": "默认提前提醒分钟数",

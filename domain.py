@@ -179,7 +179,7 @@ def parse_extraction(
         reminders_raw = item.get("remind_at", [])
         if not isinstance(reminders_raw, list) or len(reminders_raw) > MAX_REMINDERS:
             raise ExtractionError(f"remind_at 必须为列表，最多 {MAX_REMINDERS} 项。")
-        if mode == "reminder" and not reminders_raw:
+        if mode == "reminder" and not reminders_raw and not needs_confirmation and not questions:
             raise ExtractionError("仅修改提醒时必须明确新的提醒时间，例如半小时后提醒我。")
         reminders = [_timestamp(value, "提醒时间") for value in reminders_raw]
         if due_at is not None and due_at <= now and mode != "reminder":
