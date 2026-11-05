@@ -127,7 +127,7 @@ def parse_extraction(
     in create/postpone modes. Reminder-only edits must specify explicit future
     reminders and may retain an existing, already-overdue task deadline.
     """
-    if mode not in ("create", "postpone", "reminder"):
+    if mode not in ("create", "auto", "postpone", "reminder"):
         raise ExtractionError("不支持的提取模式。")
     _local_now(now)
     validate_clock(date_reminder_time)
@@ -138,6 +138,14 @@ def parse_extraction(
     ):
         raise ExtractionError("默认提前分钟数必须在 0 到 525600 之间。")
     payload = _load_json(raw)
+    if mode == "auto":
+        is_task = payload.get("is_task")
+        if not isinstance(is_task, bool):
+            raise ExtractionError("自动识别结果缺少 is_task 布尔字段，请重新提交。")
+        if not is_task:
+            if payload.get("tasks") != [] or payload.get("questions") != []:
+                raise ExtractionError("自动识别结果矛盾，未认定待办时不得返回候选任务。")
+            return {"tasks": [], "questions": [], "is_task": False}
     tasks_data = payload.get("tasks")
     questions_data = payload.get("questions", [])
     if not isinstance(tasks_data, list) or len(tasks_data) > MAX_TASKS:
@@ -217,7 +225,10 @@ def parse_extraction(
         )
     if not tasks and not questions:
         questions.append("没有识别到可执行的待办，请补充要做的事及截止或提醒时间。")
-    return {"tasks": tasks, "questions": list(dict.fromkeys(questions))}
+    result = {"tasks": tasks, "questions": list(dict.fromkeys(questions))}
+    if mode == "auto":
+        result["is_task"] = True
+    return result
 
 
 def format_time(timestamp: int | None, precision: str = "datetime") -> str:
@@ -243,7 +254,7 @@ def build_extraction_prompt(
 ) -> str:
     """Build an explicit Chinese extraction contract for a stateless model call."""
     local = _local_now(now)
-    if mode not in ("create", "postpone", "reminder"):
+    if mode not in ("create", "auto", "postpone", "reminder"):
         raise ExtractionError("不支持的提取模式。")
     prefix = (
         "你是个人待办信息提取器。只提取用户明确提交的任务，严格返回一个 JSON 对象。"
@@ -279,6 +290,18 @@ def build_extraction_prompt(
         '"remind_at":[],"needs_confirmation":false,"question":""}],"questions":[]}。'
         "只输出JSON，不要Markdown、解释或代码。\n"
     )
+    if mode == "auto":
+        prefix += (
+            "\n本次是私聊自动识别，用户无需说‘记一下’或使用指令。"
+            "识别通知、作业发布、报名要求、需要提交的材料、明确个人计划等尚待完成的具体事项。"
+            "例如‘四级词汇4作业已发布在U校园，截止时间7号晚上，请按时完成’包含待办；"
+            "即使日期或时刻有歧义，也要认定is_task=true，再提出必要的确认问题。"
+            "普通问候、闲聊、单纯提问、只是陈述已经做完的事情不建立待办，"
+            '必须返回{"is_task":false,"tasks":[],"questions":[]}，不要追问用户要记什么。'
+            "有待办时在上述输出格式的顶层额外设置is_task=true。"
+            "禁止仅因消息提到日期就建立任务，也不要把‘你会做什么’当任务。"
+            "任务内容和日期仍遵守前面所有校验规则；不确定是否有可执行事项时判为非待办。\n"
+        )
     if mode in ("postpone", "reminder"):
         if not isinstance(original_task, dict):
             raise ExtractionError("修改模式必须提供原任务。")

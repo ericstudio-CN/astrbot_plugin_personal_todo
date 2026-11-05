@@ -11,6 +11,12 @@
     "hint": "留空复用当前会话模型。填写 AstrBot 配置中的提供商 ID，不是 DeepSeek 模型名。请在提供商中配置支持图片的 DeepSeek V4.1 Flash 1017。",
     "default": ""
   },
+  "auto_capture_enabled": {
+    "description": "自动识别本人私聊中的待办",
+    "type": "bool",
+    "default": true,
+    "hint": "直接发送通知文字或图片即可识别，无须 /记一下。普通聊天和其他插件指令不建立待办。识别到任务后由本插件回复入库结果。"
+  },
   "default_lead_minutes": {
     "description": "默认提前提醒分钟数",
     "type": "int",

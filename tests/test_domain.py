@@ -41,6 +41,26 @@ def output(**changes):
 
 
 class DomainTests(unittest.TestCase):
+    def test_auto_non_task_has_no_artificial_clarification(self):
+        result = parse_extraction('{"is_task":false,"tasks":[],"questions":[]}', NOW, mode="auto")
+        self.assertEqual(result, {"is_task": False, "tasks": [], "questions": []})
+
+    def test_auto_requires_consistent_explicit_decision(self):
+        data = json.loads(output())
+        for decision in (None, "true", False):
+            candidate = dict(data)
+            if decision is not None:
+                candidate["is_task"] = decision
+            with self.subTest(decision=decision), self.assertRaises(ExtractionError):
+                parse_extraction(json.dumps(candidate), NOW, mode="auto")
+
+    def test_auto_task_uses_same_deadline_validation_and_defaults(self):
+        data = json.loads(output())
+        data["is_task"] = True
+        result = parse_extraction(json.dumps(data), NOW, mode="auto")
+        self.assertTrue(result["is_task"])
+        self.assertEqual([stamp("2026-11-06T16:00:00+08:00")], result["tasks"][0]["reminder_times"])
+
     def test_datetime_defaults_and_high_extra_day(self):
         task = parse_extraction(output(importance="high"), NOW)["tasks"][0]
         self.assertEqual(

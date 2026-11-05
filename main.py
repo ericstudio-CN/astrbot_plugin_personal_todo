@@ -29,6 +29,7 @@ from .media import MediaError, image_data_uri
 from .storage import TaskStore
 
 HELP = """个人待办（仅本人私聊，北京时间）
+直接发通知文字或图片即可自动识别；普通聊天不会记录。
 /记一下 明天下午六点交材料，提前两小时提醒
 /记一下 + 图片，也可引用消息后发送 /记一下
 /待办 列表｜今日｜详情 23
@@ -39,6 +40,7 @@ HELP = """个人待办（仅本人私聊，北京时间）
 /待办 补充 这里的明天是11月8日
 /待办 汇总 开｜关｜20:30
 /待办 测试提醒（约一分钟后发送）
+/待办 状态（检查版本、自动识别开关）
 /待办 帮助
 日期不明确时先补充信息，确认清楚后才建立待办。
 没有截止日期也没有提醒时间的事项只进入清单。"""
@@ -56,7 +58,10 @@ def _integer(value, minimum: int, maximum: int, name: str) -> int:
     return result
 
 
-@register("astrbot_plugin_personal_todo", "Personal Todo contributors", "个人待办与提醒", "0.1.0")
+VERSION = "0.2.0"
+
+
+@register("astrbot_plugin_personal_todo", "Personal Todo contributors", "个人待办与提醒", VERSION)
 class PersonalTodoPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -92,6 +97,13 @@ class PersonalTodoPlugin(Star):
         )
         self._closing = False
         self.worker = asyncio.create_task(self._worker(), name="personal-todo-reminders")
+        logger.info(
+            "个人待办 v%s 已加载：自动识别=%s，主人配置=%s，检查间隔=%ss",
+            VERSION,
+            self.config.get("auto_capture_enabled", True),
+            bool(self.owner),
+            self.poll_seconds,
+        )
         if not self.owner:
             logger.warning("个人待办：请先在插件配置中填写 owner_qq，再私聊机器人。")
 
@@ -132,7 +144,68 @@ class PersonalTodoPlugin(Star):
         match = re.search(rf"(?:{names})(?=\s|$)", text, flags=re.IGNORECASE)
         return text[match.end() :].strip() if match else ""
 
-    @filter.command("记一下", alias={"记待办"})
+    def _is_command_event(self, event: AstrMessageEvent) -> bool:
+        """Leave registered commands and explicit command prefixes to their handlers.
+
+        AstrBot may already have stripped the wake prefix from message_str, so
+        also inspect the original Plain components and matched handler metadata.
+        """
+        for handler in event.get_extra("activated_handlers", []) or []:
+            if any(
+                type(item).__name__ in {"CommandFilter", "CommandGroupFilter"}
+                for item in getattr(handler, "event_filters", [])
+            ):
+                return True
+        text = event.get_message_str().strip()
+        if re.match(r"^(?:待办|todo|记一下|记待办)(?:\s|$)", text, re.IGNORECASE):
+            return True
+        raw_text = "".join(
+            c.text for c in event.get_messages() if isinstance(c, Comp.Plain)
+        ).strip()
+        prefixes = ["/"]
+        get_config = getattr(self.context, "get_config", None)
+        if callable(get_config):
+            cfg = get_config(umo=event.unified_msg_origin)
+            configured = cfg.get("wake_prefix", [])
+            if isinstance(configured, list):
+                prefixes.extend(p for p in configured if isinstance(p, str) and p)
+        return any(raw_text.startswith(prefix) for prefix in prefixes)
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=99999)
+    async def auto_capture(self, event: AstrMessageEvent):
+        """Recognize owner notifications before ordinary chat/merger handlers."""
+        if (
+            not self.config.get("auto_capture_enabled", True)
+            or event.get_platform_name() != "aiocqhttp"
+            or not event.is_private_chat()
+            or not self.owner
+            or str(event.get_sender_id()) != self.owner
+            or self._is_command_event(event)
+        ):
+            return
+        text = event.get_message_str().strip()
+        if not text and not any(
+            isinstance(c, (Comp.Image, Comp.Reply)) for c in event.get_messages()
+        ):
+            return
+        error = self._authorize(event)
+        if error:
+            event.stop_event()
+            yield event.plain_result(error)
+            return
+        logger.info(
+            "个人待办：自动识别开始 message_id=%s text_chars=%s",
+            getattr(event.message_obj, "message_id", "unknown"),
+            len(text),
+        )
+        result = await self._safe_capture(event, text, mode="auto")
+        if result is not None:
+            # Only our saved/clarification/error response may promise task state.
+            # Stop the downstream chat model and message-merger for this task.
+            event.stop_event()
+            yield event.plain_result(result)
+
+    @filter.command("记一下", alias={"记待办"}, priority=100000)
     async def capture(self, event: AstrMessageEvent):
         event.stop_event()
         error = self._authorize(event)
@@ -140,9 +213,10 @@ class PersonalTodoPlugin(Star):
             yield event.plain_result(error)
             return
         text = self._body(event, "记一下|记待办")
+        logger.info("个人待办：收到手动记录指令 text_chars=%s", len(text))
         yield event.plain_result(await self._safe_capture(event, text))
 
-    @filter.command("待办", alias={"todo"})
+    @filter.command("待办", alias={"todo"}, priority=100000)
     async def todo(self, event: AstrMessageEvent):
         event.stop_event()
         error = self._authorize(event)
@@ -150,6 +224,9 @@ class PersonalTodoPlugin(Star):
             yield event.plain_result(error)
             return
         body = self._body(event, "待办|todo")
+        logger.info(
+            "个人待办：收到管理指令 action=%s", body.split(maxsplit=1)[0] if body else "列表"
+        )
         try:
             result = await self._dispatch(event, body)
         except (ValueError, MediaError) as exc:
@@ -169,6 +246,13 @@ class PersonalTodoPlugin(Star):
         now = int(time.time())
         if verb in ("帮助", "help"):
             return HELP
+        if verb == "状态":
+            return (
+                f"私人待办提醒 v{VERSION}\n"
+                f"私聊自动识别：{'开启' if self.config.get('auto_capture_enabled', True) else '关闭'}\n"
+                f"模型提供商：{self.config.get('provider_id') or '跟随当前会话模型'}\n"
+                "记录成功会回复‘已添加’和编号；时间不明确会提示补充。"
+            )
         if verb in ("", "列表", "list", "今日", "今天"):
             return self._list(now, today=verb in ("今日", "今天"))
         if verb == "汇总":
@@ -296,21 +380,26 @@ class PersonalTodoPlugin(Star):
 
     async def _safe_capture(
         self, event, text, mode="create", original_task=None, draft=None
-    ) -> str:
+    ) -> str | None:
         if self.model_lock.locked():
+            logger.info("个人待办：识别繁忙，本条尚未保存")
             return "上一条内容还在识别，请等收到结果后再提交。"
         async with self.model_lock:
             try:
                 return await self._extract(event, text, mode, original_task, draft)
             except (ExtractionError, MediaError, ValueError) as exc:
+                logger.warning(
+                    "个人待办：识别校验未通过 type=%s reason=%s", type(exc).__name__, exc
+                )
                 return f"没有保存本次修改：{exc}"
             except asyncio.TimeoutError:
+                logger.warning("个人待办：模型或图片读取超时，本次没有保存")
                 return "模型或图片读取超时，本次没有保存。请稍后重试。"
             except Exception as exc:
                 logger.error("个人待办识别失败：%s", type(exc).__name__)
                 return "处理失败，请先用 /待办 列表 核对是否已建立。请确认模型可用；有图片时需要支持视觉输入。"
 
-    async def _extract(self, event, text, mode, original_task, draft) -> str:
+    async def _extract(self, event, text, mode, original_task, draft) -> str | None:
         assert self.store is not None
         request_owner = self.owner
         payload, images = await self._input(event, text)
@@ -327,6 +416,9 @@ class PersonalTodoPlugin(Star):
             )
         if not provider_id:
             raise ValueError("请先在 AstrBot 配置一个可用的聊天模型。")
+        logger.info(
+            "个人待办：请求模型 mode=%s provider=%s images=%s", mode, provider_id, len(images)
+        )
         response = await asyncio.wait_for(
             self.context.llm_generate(
                 chat_provider_id=provider_id,
@@ -350,6 +442,14 @@ class PersonalTodoPlugin(Star):
             date_reminder_time=self.date_clock,
             mode=mode,
         )
+        if mode == "auto" and not parsed["is_task"]:
+            logger.info("个人待办：自动识别结果=非待办，继续普通聊天")
+            return None
+        logger.info(
+            "个人待办：识别完成 candidates=%s questions=%s",
+            len(parsed["tasks"]),
+            len(parsed["questions"]),
+        )
         draft_key = f"draft:{self.owner}:{event.unified_msg_origin}"
         if parsed["questions"]:
             # Store extracted evidence, not image bytes, so a clarification survives a restart.
@@ -358,7 +458,7 @@ class PersonalTodoPlugin(Star):
                 draft_key,
                 json.dumps(
                     {
-                        "mode": mode,
+                        "mode": "create" if mode == "auto" else mode,
                         "original_task": original_task,
                         "payload": previous_payload,
                         "candidates": parsed["tasks"],
@@ -371,6 +471,7 @@ class PersonalTodoPlugin(Star):
                     ensure_ascii=False,
                 ),
             )
+            logger.info("个人待办：需要补充信息，已保存确认草稿，待办尚未入库")
             return (
                 "需要补充信息，暂未保存：\n"
                 + "\n".join(f"• {q}" for q in parsed["questions"])
@@ -380,7 +481,7 @@ class PersonalTodoPlugin(Star):
         if not items:
             return "没有识别到可建立的待办，请补充具体要做的事。"
         now = int(time.time())
-        if mode != "create":
+        if mode not in ("create", "auto"):
             if len(items) != 1 or original_task is None:
                 raise ValueError("修改一次只能对应一个待办，请重新描述。")
             item = items[0]
@@ -409,6 +510,7 @@ class PersonalTodoPlugin(Star):
             if not updated:
                 return "任务已被完成或取消，本次没有修改。"
             self.store.set_meta(draft_key, "")
+            logger.info("个人待办：已更新 id=%s mode=%s", original_task["id"], mode)
             return "已更新：\n" + self._detail(updated)
         rows, created = self.store.add_tasks(
             self.owner,
@@ -418,6 +520,12 @@ class PersonalTodoPlugin(Star):
             now,
         )
         self.store.set_meta(draft_key, "")
+        logger.info(
+            "个人待办：%s count=%s ids=%s",
+            "已入库" if created else "重复消息未重复入库",
+            len(rows),
+            ",".join(str(row["id"]) for row in rows),
+        )
         heading = "已添加：" if created else "这条消息已处理，未重复添加："
         return heading + "\n\n" + "\n\n".join(self._detail(row) for row in rows)
 
@@ -530,6 +638,7 @@ class PersonalTodoPlugin(Star):
             else:
                 for job in jobs:
                     self.store.acknowledge(job["reminder_id"], int(time.time()))
+                logger.info("个人待办：提醒投递成功 count=%s", len(jobs))
         await self._daily_summary(now)
 
     async def _daily_summary(self, now: int):
@@ -557,6 +666,8 @@ class PersonalTodoPlugin(Star):
                 self.store.set_meta(f"summary_retry:{self.owner}", str(now + 300))
                 return
         self.store.set_meta(marker, day)
+        if rows:
+            logger.info("个人待办：每日汇总投递成功 date=%s count=%s", day, len(rows))
 
     async def _worker(self):
         # Yield during startup so platform connections can finish loading.
