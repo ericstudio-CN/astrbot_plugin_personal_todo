@@ -79,6 +79,7 @@ def load_adapter():
         command=unchanged_decorator,
         event_message_type=unchanged_decorator,
         on_llm_request=unchanged_decorator,
+        on_decorating_result=unchanged_decorator,
         llm_tool=unchanged_decorator,
         EventMessageType=types.SimpleNamespace(PRIVATE_MESSAGE="private-message"),
     )
@@ -135,6 +136,7 @@ class Event:
         self.components = [Plain(text)] if components is None else components
         self.stopped = False
         self.extras = {}
+        self.result = None
 
     def is_private_chat(self):
         return self.private
@@ -159,6 +161,17 @@ class Event:
 
     def get_extra(self, key, default=None):
         return self.extras.get(key, default)
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
+
+    def get_result(self):
+        return self.result
+
+    def set_result(self, value):
+        self.result = (
+            types.SimpleNamespace(chain=[Plain(value)]) if isinstance(value, str) else value
+        )
 
 
 class PluginTests(unittest.IsolatedAsyncioTestCase):
@@ -357,7 +370,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_reports_version_and_auto_default_for_existing_config(self):
         result = await self.command("/待办 状态")
-        self.assertIn("v0.3.0", result)
+        self.assertIn("v0.3.1", result)
         self.assertIn("私聊自动识别：开启", result)
 
     def add_due_task(

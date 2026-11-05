@@ -16,6 +16,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
+from .compat import has_dsml, infer_read_action, is_format_discussion, is_own_dsml_call
 from .conversation import CONTEXT_MARKER, TOOL_NAME, build_chat_context
 from .domain import (
     LOCAL_TZ,
@@ -60,7 +61,7 @@ def _integer(value, minimum: int, maximum: int, name: str) -> int:
     return result
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 
 @register("astrbot_plugin_personal_todo", "Personal Todo contributors", "个人待办与提醒", VERSION)
@@ -255,11 +256,14 @@ class PersonalTodoPlugin(Star):
         if verb in ("帮助", "help"):
             return HELP
         if verb == "状态":
+            diagnostic = await self._tool_diagnostic(event.unified_msg_origin)
             return (
                 f"私人待办提醒 v{VERSION}\n"
                 f"私聊自动识别：{'开启' if self.config.get('auto_capture_enabled', True) else '关闭'}\n"
                 f"自然对话与人格融合：{'开启' if self.config.get('conversational_mode', True) else '关闭'}\n"
                 f"模型提供商：{self.config.get('provider_id') or '跟随当前会话模型'}\n"
+                f"模型工具调用能力：{diagnostic['capability']}\n"
+                f"工具调用模式：{diagnostic['mode']}（推荐 full）\n"
                 "自然对话由当前人格通过 personal_todo 工具操作并回复；备用指令显示完整编号。"
             )
         if verb in ("", "列表", "list", "今日", "今天"):
@@ -360,6 +364,46 @@ class PersonalTodoPlugin(Star):
         draft = json.loads(raw)
         return draft if int(time.time()) - draft["created_at"] <= 86400 else None
 
+    async def _tool_diagnostic(self, origin: str) -> dict:
+        result = {"capability": "未确认", "mode": "full", "blocked": False}
+        get_config = getattr(self.context, "get_config", None)
+        if callable(get_config):
+            cfg = get_config(umo=origin) or {}
+            result["mode"] = (
+                cfg.get("agent_runner", {})
+                .get("config", {})
+                .get("misc", {})
+                .get(
+                    "tool_schema_mode",
+                    cfg.get("provider_settings", {}).get("tool_schema_mode", "full"),
+                )
+            )
+        get_provider = getattr(self.context, "get_using_provider_async", None)
+        if callable(get_provider):
+            try:
+                provider = await get_provider(umo=origin)
+                modalities = getattr(provider, "provider_config", {}).get("modalities")
+                if isinstance(modalities, list) and modalities:
+                    result["blocked"] = "tool_use" not in modalities
+                    result["capability"] = (
+                        "已开启 tool_use"
+                        if not result["blocked"]
+                        else "未开启 tool_use，AstrBot 会过滤工具"
+                    )
+            except Exception as exc:
+                logger.warning("个人待办：模型工具能力诊断失败 type=%s", type(exc).__name__)
+        return result
+
+    def _chat_task_facts(self) -> list[dict]:
+        rows = self.store.list_tasks(self.owner, limit=21)
+        for row in rows:
+            row["reminders"] = [
+                format_time(item["scheduled_at"])
+                for item in self.store.list_reminders(row["id"], self.owner)
+                if item["state"] in ("pending", "processing")
+            ]
+        return rows
+
     @filter.on_llm_request()
     async def enrich_chat(self, event: AstrMessageEvent, req):
         """Append capabilities and live facts without replacing the persona."""
@@ -389,6 +433,7 @@ class PersonalTodoPlugin(Star):
             getattr(tool, "name", "") == TOOL_NAME
             for tool in getattr(tool_set, "tools", getattr(tool_set, "func_list", []))
         )
+        event.set_extra("_personal_todo_tool_available", available)
         if not available:
             logger.warning(
                 "个人待办：当前会话未提供 personal_todo 工具，请在当前人格能力中启用本插件工具"
@@ -405,15 +450,27 @@ class PersonalTodoPlugin(Star):
             return
         req.system_prompt = base_prompt + build_chat_context(
             int(time.time()),
-            self.store.list_tasks(self.owner, limit=21),
+            self._chat_task_facts(),
             self._draft(event.unified_msg_origin),
             self.store.get_meta(f"focus:{self.owner}:{event.unified_msg_origin}"),
         )
-        logger.info("个人待办：已接入当前人格对话，personal_todo 工具可用")
+        diagnostic = await self._tool_diagnostic(event.unified_msg_origin)
+        logger.info(
+            "个人待办：模型工具诊断 capability=%s mode=%s",
+            diagnostic["capability"],
+            diagnostic["mode"],
+        )
+        if diagnostic["blocked"]:
+            logger.warning(
+                "个人待办：请在当前 DeepSeek 模型能力中勾选工具调用/tool_use，工具模式设为 full"
+            )
+            req.system_prompt += "\n本次模型能力配置未开启 tool_use，工具会被框架过滤。可以依据上方真实数据库快照回答只读查询；不能执行新增或修改，也不能输出 DSML。若需修改，说明需在模型能力中开启工具调用。"
+        if not diagnostic["blocked"]:
+            logger.info("个人待办：已接入当前人格对话，personal_todo 工具可用")
 
     @filter.llm_tool(name="personal_todo")
     async def personal_todo(
-        self, event: AstrMessageEvent, action: str, text: str = "", task_id: int = 0
+        self, event: AstrMessageEvent, action: str = "auto", text: str = "", task_id: int = 0
     ) -> str:
         """在正常对话中管理主人的待办，返回真实数据库结果供当前人格自然回复。
 
@@ -429,6 +486,10 @@ class PersonalTodoPlugin(Star):
             return "自然对话模式已关闭，本次没有执行；可开启插件的自然对话模式或使用备用待办指令。"
         tool_owner = self.owner
         try:
+            if action in ("", "auto"):
+                action = infer_read_action(event.get_message_str())
+                if action is None:
+                    return "工具参数缺少明确操作，本次没有修改待办。请根据主人原话重新选择正确的 action，不要让主人填写工具参数。"
             if not isinstance(action, str) or not isinstance(text, str) or len(text) > 16000:
                 return "参数不合法，本次没有执行。"
             if (
@@ -487,6 +548,82 @@ class PersonalTodoPlugin(Star):
         except Exception as exc:
             logger.error("个人待办对话工具失败：%s", type(exc).__name__)
             return "本次操作未能正常完成，请先查询真实待办状态，不要宣称成功。"
+
+    async def _recovered_query_answer(self, event: AstrMessageEvent, action: str) -> str:
+        request_owner = self.owner
+        facts = self._list(int(time.time()), today=action == "today")
+        if "提醒" in event.get_message_str():
+            rows = self.store.list_tasks(request_owner, limit=30)
+            reminder_lines = []
+            for row in rows:
+                points = [
+                    format_time(r["scheduled_at"])
+                    for r in self.store.list_reminders(row["id"], request_owner)
+                    if r["state"] in ("pending", "processing")
+                ]
+                if points:
+                    reminder_lines.append(f"#{row['id']:03d} {row['title']}：" + "、".join(points))
+            facts += "\n\n待发送提醒：\n" + ("\n".join(reminder_lines) or "当前没有待发送的提醒。")
+        try:
+
+            async def render():
+                persona = await self._current_persona_prompt(event.unified_msg_origin)
+                provider = await self.context.get_current_chat_provider_id(
+                    umo=event.unified_msg_origin
+                )
+                response = await self.context.llm_generate(
+                    chat_provider_id=provider,
+                    contexts=[],
+                    system_prompt=persona
+                    + "\n现在只根据程序已经查询到的真实待办信息，用原人格简短回答主人的查询。不得调用工具、输出 DSML/XML/JSON 伪调用、声称新增或修改任务；任务名和时间不得改变，不要自我介绍。",
+                    prompt=json.dumps(
+                        {"user_question": event.get_message_str(), "database_facts": facts},
+                        ensure_ascii=False,
+                    ),
+                )
+                return response.completion_text.strip()
+
+            answer = await asyncio.wait_for(render(), timeout=15)
+            if self.owner != request_owner:
+                return "主人配置已变更，请重新查询。"
+            return answer if answer and len(answer) <= 6000 and not has_dsml(answer) else facts
+        except Exception as exc:
+            logger.warning(
+                "个人待办：查询人格回复不可用，返回真实查询结果 type=%s", type(exc).__name__
+            )
+            return facts if self.owner == request_owner else "主人配置已变更，请重新查询。"
+
+    @filter.on_decorating_result(priority=100000)
+    async def recover_tool_markup(self, event: AstrMessageEvent):
+        """Repair only our leaked call's read-only answer, not arbitrary text tools."""
+        if (
+            not self._owned_chat(event)
+            or not self.store
+            or self._closing
+            or not self.config.get("conversational_mode", True)
+        ):
+            return
+        result = event.get_result()
+        if not result:
+            return
+        text = "\n".join(part.text for part in result.chain if isinstance(part, Comp.Plain))
+        if not is_own_dsml_call(text):
+            return
+        if is_format_discussion(event.get_message_str()):
+            return
+        logger.warning("个人待办：截获未执行的 DSML 伪调用；请检查 tool_use 与 full 工具模式")
+        cached = event.get_extra("_personal_todo_recovered_answer")
+        if cached:
+            event.set_result(event.plain_result(cached))
+            return
+        action = infer_read_action(event.get_message_str())
+        if action and event.get_extra("_personal_todo_tool_available", False):
+            answer = await self._recovered_query_answer(event, action)
+            logger.info("个人待办：DSML 兼容查询已读取真实数据库 action=%s", action)
+        else:
+            answer = "这次待办工具调用没有成功，我不能把它当作已经执行。请在 AstrBot 的当前模型能力中开启工具调用（tool_use），并把工具调用模式设为 full 后再试。"
+        event.set_extra("_personal_todo_recovered_answer", answer)
+        event.set_result(event.plain_result(answer))
 
     def _source_key(self, event: AstrMessageEvent, text: str) -> str:
         message_id = getattr(event.message_obj, "message_id", None)
