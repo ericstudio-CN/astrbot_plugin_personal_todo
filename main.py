@@ -28,6 +28,16 @@ from .domain import (
     validate_clock,
 )
 from .media import MediaError, image_data_uri
+from .notifications import (
+    NOTIFICATION_INSTRUCTIONS,
+    agrees_to_expand,
+    declines_to_expand,
+    notification_payload,
+    parse_notification,
+    preview_fallback,
+    requests_all,
+    select_preview,
+)
 from .storage import TaskStore
 
 HELP = """个人待办（仅本人私聊，北京时间）
@@ -41,7 +51,7 @@ HELP = """个人待办（仅本人私聊，北京时间）
 /待办 提醒 23 半小时后提醒我
 /待办 重要 23 高（或普通、低）
 /待办 补充 这里的明天是11月8日
-/待办 汇总 开｜关｜20:30
+/待办 汇总 开｜关｜20:30｜自然｜固定
 /待办 测试提醒（约一分钟后发送）
 /待办 状态（检查版本、自动识别开关）
 /待办 帮助
@@ -61,7 +71,7 @@ def _integer(value, minimum: int, maximum: int, name: str) -> int:
     return result
 
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 
 @register("astrbot_plugin_personal_todo", "Personal Todo contributors", "个人待办与提醒", VERSION)
@@ -92,6 +102,7 @@ class PersonalTodoPlugin(Star):
         )
         self.image_limit = _integer(self.config.get("max_image_mb", 8), 1, 16, "图片大小") * 1024**2
         self.date_clock = validate_clock(self.config.get("date_reminder_time", "20:00"))
+        self._notification_options()
         validate_clock(self.config.get("daily_summary_time", "21:00"))
         self.store = TaskStore(
             StarTools.get_data_dir("astrbot_plugin_personal_todo") / "todo.sqlite3"
@@ -264,6 +275,7 @@ class PersonalTodoPlugin(Star):
                 f"模型提供商：{self.config.get('provider_id') or '跟随当前会话模型'}\n"
                 f"模型工具调用能力：{diagnostic['capability']}\n"
                 f"工具调用模式：{diagnostic['mode']}（推荐 full）\n"
+                f"提醒格式：{'固定清单' if self._fixed_notifications() else '人格自然对话'}；近期{self._notification_options()[0]}天，最多{self._notification_options()[1]}项\n"
                 "自然对话由当前人格通过 personal_todo 工具操作并回复；备用指令显示完整编号。"
             )
         if verb in ("", "列表", "list", "今日", "今天"):
@@ -364,6 +376,108 @@ class PersonalTodoPlugin(Star):
         draft = json.loads(raw)
         return draft if int(time.time()) - draft["created_at"] <= 86400 else None
 
+    def _notification_options(self) -> tuple[int, int]:
+        return (
+            _integer(self.config.get("summary_window_days", 2), 1, 7, "近期汇总天数"),
+            _integer(self.config.get("summary_max_items", 3), 1, 8, "主动展示事项上限"),
+        )
+
+    def _fixed_notifications(self) -> bool:
+        override = self.store.get_meta(f"notification_fixed:{self.owner}") if self.store else None
+        fixed = (
+            bool(self.config.get("fixed_notification_format", False))
+            if override is None
+            else bool(override)
+        )
+        return fixed or not self.config.get("conversational_mode", True)
+
+    def _more_offer(self, event: AstrMessageEvent, *, bind=False) -> dict | None:
+        key = f"more_offer:{self.owner}:{event.unified_msg_origin}"
+        offer = self.store.get_meta(key)
+        if not isinstance(offer, dict) or int(time.time()) - offer.get("time", 0) > 7200:
+            return None
+        source = self._source_key(event, event.get_message_str())
+        if bind and not offer.get("claimed_by"):
+            if declines_to_expand(event.get_message_str()):
+                self.store.set_meta(key, None)
+                return None
+            offer["claimed_by"] = source
+            self.store.set_meta(key, offer)
+        return offer if offer.get("claimed_by") == source else None
+
+    def _record_more_offer(
+        self,
+        owner: str,
+        origin: str,
+        rows: list[dict],
+        visible: list[dict],
+        now: int,
+        *,
+        scope="pending",
+    ):
+        key = f"more_offer:{owner}:{origin}"
+        hidden = len(rows) - len(visible)
+        self.store.set_meta(
+            key,
+            {
+                "time": now,
+                "scope": scope,
+                "hidden_count": hidden,
+                "task_ids": [row["id"] for row in rows],
+                "shown_ids": [row["id"] for row in visible],
+            }
+            if hidden
+            else None,
+        )
+
+    def _expands_offer(self, event: AstrMessageEvent) -> bool:
+        return bool(
+            self._more_offer(event, bind=True) and agrees_to_expand(event.get_message_str())
+        )
+
+    def _query_facts(self, event: AstrMessageEvent, *, today=False) -> str:
+        now = int(time.time())
+        rows = self.store.list_tasks(self.owner, limit=500)
+        offer = self._more_offer(event, bind=True)
+        expanded = bool(offer and agrees_to_expand(event.get_message_str()))
+        show_all = requests_all(event.get_message_str()) or expanded
+        if show_all:
+            if today:
+                rows = select_preview(
+                    rows, now, self._notification_options()[0], len(rows), today=True
+                )["visible"]
+            if (
+                expanded
+                and offer["scope"] == "reminders"
+                and not re.search(r"全部待办|所有任务|所有待办|完整待办", event.get_message_str())
+            ):
+                ids = set(offer["task_ids"])
+                rows = [row for row in rows if row["id"] in ids]
+            self.store.set_meta(f"more_offer:{self.owner}:{event.unified_msg_origin}", None)
+            return "主人已明确要求展开，以下是真实未完成事项：\n\n" + (
+                "\n\n".join(self._detail(row) for row in rows[:30]) or "当前没有未完成事项。"
+            )
+        days, maximum = self._notification_options()
+        preview = select_preview(rows, now, days, maximum, today=today)
+        visible, hidden = preview["visible"], preview["hidden"]
+        declined = declines_to_expand(event.get_message_str())
+        if declined:
+            self.store.set_meta(f"more_offer:{self.owner}:{event.unified_msg_origin}", None)
+        else:
+            self._record_more_offer(self.owner, event.unified_msg_origin, rows, visible, now)
+        return (
+            f"以下仅为近期重点，最多{maximum}项；不要主动展开其他事项。\n"
+            + (
+                "\n\n".join(self._detail(row) for row in visible)
+                or "这段时间没有临近截止或最近逾期的待办。"
+            )
+            + (
+                f"\n另有{len(hidden)}项未展开，请沿用人格询问主人是否想看完整清单，获得同意前不要列出。"
+                if hidden and not declined
+                else ""
+            )
+        )
+
     async def _tool_diagnostic(self, origin: str) -> dict:
         result = {"capability": "未确认", "mode": "full", "blocked": False}
         get_config = getattr(self.context, "get_config", None)
@@ -453,6 +567,11 @@ class PersonalTodoPlugin(Star):
             self._chat_task_facts(),
             self._draft(event.unified_msg_origin),
             self.store.get_meta(f"focus:{self.owner}:{event.unified_msg_origin}"),
+            offer=self._more_offer(event, bind=True),
+            preferences={
+                "days": self._notification_options()[0],
+                "max_items": self._notification_options()[1],
+            },
         )
         diagnostic = await self._tool_diagnostic(event.unified_msg_origin)
         logger.info(
@@ -476,7 +595,7 @@ class PersonalTodoPlugin(Star):
 
         Args:
             action(string): add添加通知/文字/当前图片，clarify补充上次追问，discard_draft放弃未保存草稿，list查询未完成，today今日到期，details详情，complete完成，cancel取消，postpone改截止，remind改提醒，importance改重要性，summary改汇总。
-            text(string): 完整任务或补充内容，结合对话补全指代；postpone给新截止，remind给新提醒，importance用高/普通/低，summary用开/关/HH:MM；纯查询填空字符串。
+            text(string): 完整任务或补充内容，结合对话补全指代；postpone给新截止，remind给新提醒，importance用高/普通/低，summary用开/关/HH:MM/自然/固定；纯查询填空字符串。
             task_id(number): 修改或查询详情的任务编号，须从上下文或list结果确定；添加、补充、列表、汇总填0。不能猜测编号。
         """
         error = self._authorize(event)
@@ -488,6 +607,8 @@ class PersonalTodoPlugin(Star):
         try:
             if action in ("", "auto"):
                 action = infer_read_action(event.get_message_str())
+                if action is None and self._expands_offer(event):
+                    action = "list"
                 if action is None:
                     return "工具参数缺少明确操作，本次没有修改待办。请根据主人原话重新选择正确的 action，不要让主人填写工具参数。"
             if not isinstance(action, str) or not isinstance(text, str) or len(text) > 16000:
@@ -517,11 +638,12 @@ class PersonalTodoPlugin(Star):
             elif action == "discard_draft":
                 self.store.set_meta(f"draft:{self.owner}:{event.unified_msg_origin}", "")
                 return "已放弃尚未保存的草稿，已保存的待办不受影响。"
-            elif action in ("list", "today", "summary"):
+            elif action in ("list", "today"):
+                result = self._query_facts(event, today=action == "today")
+            elif action == "summary":
                 result = await self._dispatch(
                     event,
-                    {"list": "列表", "today": "今日", "summary": "汇总"}[action]
-                    + (" " + text if text else ""),
+                    "汇总" + (" " + text if text else ""),
                 )
             else:
                 verbs = {
@@ -551,19 +673,7 @@ class PersonalTodoPlugin(Star):
 
     async def _recovered_query_answer(self, event: AstrMessageEvent, action: str) -> str:
         request_owner = self.owner
-        facts = self._list(int(time.time()), today=action == "today")
-        if "提醒" in event.get_message_str():
-            rows = self.store.list_tasks(request_owner, limit=30)
-            reminder_lines = []
-            for row in rows:
-                points = [
-                    format_time(r["scheduled_at"])
-                    for r in self.store.list_reminders(row["id"], request_owner)
-                    if r["state"] in ("pending", "processing")
-                ]
-                if points:
-                    reminder_lines.append(f"#{row['id']:03d} {row['title']}：" + "、".join(points))
-            facts += "\n\n待发送提醒：\n" + ("\n".join(reminder_lines) or "当前没有待发送的提醒。")
+        facts = self._query_facts(event, today=action == "today")
         try:
 
             async def render():
@@ -617,6 +727,8 @@ class PersonalTodoPlugin(Star):
             event.set_result(event.plain_result(cached))
             return
         action = infer_read_action(event.get_message_str())
+        if action is None and self._expands_offer(event):
+            action = "list"
         if action and event.get_extra("_personal_todo_tool_available", False):
             answer = await self._recovered_query_answer(event, action)
             logger.info("个人待办：DSML 兼容查询已读取真实数据库 action=%s", action)
@@ -868,7 +980,15 @@ class PersonalTodoPlugin(Star):
     def _summary_settings(self, value: str) -> str:
         key = f"summary_enabled:{self.owner}"
         clock_key = f"summary_clock:{self.owner}"
-        if value == "开":
+        if value in ("自然", "固定"):
+            self.config["fixed_notification_format"] = value == "固定"
+            save = getattr(self.config, "save_config", None)
+            if callable(save):
+                save()
+                self.store.set_meta(f"notification_fixed:{self.owner}", None)
+            else:
+                self.store.set_meta(f"notification_fixed:{self.owner}", value == "固定")
+        elif value == "开":
             self.store.set_meta(key, "true")
         elif value == "关":
             self.store.set_meta(key, "false")
@@ -876,9 +996,7 @@ class PersonalTodoPlugin(Star):
             self.store.set_meta(clock_key, validate_clock(value))
             self.store.set_meta(key, "true")
         enabled, clock = self._summary_config()
-        return (
-            f"每日汇总：{'开启' if enabled else '关闭'}；北京时间 {clock}。只在有未完成事项时发送。"
-        )
+        return f"每日汇总：{'开启' if enabled else '关闭'}；北京时间 {clock}。提醒格式：{'固定清单' if self._fixed_notifications() else '人格自然对话'}；近期{self._notification_options()[0]}天、最多{self._notification_options()[1]}项。其他事项先询问是否展开。"
 
     def _summary_config(self) -> tuple[bool, str]:
         enabled = self.store.get_meta(f"summary_enabled:{self.owner}")
@@ -930,8 +1048,37 @@ class PersonalTodoPlugin(Star):
             persona = await manager.get_default_persona_v3(umo=origin)
         return persona.get("prompt", "") if persona else ""
 
-    async def _notification_text(self, origin: str, facts: str) -> str:
-        """Use persona for a short opening; immutable facts never go through rewriting."""
+    async def _notification_text(
+        self, origin: str, facts: str, *, tasks=None, now=None, hidden_count=0, kind="reminder"
+    ) -> str:
+        """Render the entire brief in the selected persona, or an optional fixed list."""
+        if tasks is not None and not self._fixed_notifications():
+            fallback = preview_fallback(tasks, now, hidden_count, kind=kind)
+            if not self.config.get("persona_notifications", True):
+                return fallback
+
+            async def natural():
+                persona = await self._current_persona_prompt(origin)
+                if not persona:
+                    return fallback
+                provider = await self.context.get_current_chat_provider_id(umo=origin)
+                response = await self.context.llm_generate(
+                    chat_provider_id=provider,
+                    contexts=[],
+                    system_prompt=persona + "\n" + NOTIFICATION_INSTRUCTIONS,
+                    prompt=json.dumps(
+                        notification_payload(tasks, now, hidden_count, kind), ensure_ascii=False
+                    ),
+                )
+                return parse_notification(response.completion_text, tasks, now, hidden_count)
+
+            try:
+                return await asyncio.wait_for(natural(), timeout=8)
+            except Exception as exc:
+                logger.warning(
+                    "个人待办：人格正文生成不可用，发送简短提醒 type=%s", type(exc).__name__
+                )
+                return fallback
         if not self.config.get("conversational_mode", True) or not self.config.get(
             "persona_notifications", True
         ):
@@ -978,6 +1125,28 @@ class PersonalTodoPlugin(Star):
         )
         return "\n\n".join(lines)
 
+    def _summary_facts(self, rows: list[dict], now: int, hidden_count: int) -> str:
+        day = datetime.fromtimestamp(now, LOCAL_TZ).date().isoformat()
+        text = f"📋 {day} 近期未完成待办汇总（只展示{len(rows)}项）\n\n"
+        text += (
+            "\n\n".join(self._line(row, now) for row in rows)
+            if rows
+            else "这段时间没有临近截止或最近逾期的待办。"
+        )
+        if hidden_count:
+            text += f"\n\n另外还有{hidden_count}项未展开，要我把完整清单也给你看看吗？"
+        return text
+
+    def _brief_fallback(self, rows: list[dict], now: int, hidden_count: int, kind: str) -> str:
+        if self._fixed_notifications():
+            if kind == "summary":
+                return self._summary_facts(rows, now, hidden_count)
+            text = self._reminder_facts(rows, now)
+            return text + (
+                f"\n\n另外还有{hidden_count}条提醒未展开，要一起看看吗？" if hidden_count else ""
+            )
+        return preview_fallback(rows, now, hidden_count, kind=kind)
+
     async def _tick(self, now: int):
         if not self.store or not self.owner:
             return
@@ -998,7 +1167,15 @@ class PersonalTodoPlugin(Star):
             ]
             if not jobs:
                 continue
-            text = await self._notification_text(origin, self._reminder_facts(jobs, now))
+            maximum = self._notification_options()[1]
+            visible = jobs[:maximum]
+            hidden_count = len(jobs) - len(visible)
+            facts = self._reminder_facts(visible, now)
+            if hidden_count:
+                facts += f"\n\n另外还有{hidden_count}条提醒未展开，要一起看看吗？"
+            text = await self._notification_text(
+                origin, facts, tasks=visible, now=now, hidden_count=hidden_count
+            )
             active = [
                 job
                 for job in jobs
@@ -1007,7 +1184,9 @@ class PersonalTodoPlugin(Star):
             if not active:
                 continue
             if len(active) != len(jobs):
-                text = self._reminder_facts(active, now)
+                visible = active[:maximum]
+                hidden_count = len(active) - len(visible)
+                text = self._brief_fallback(visible, now, hidden_count, "reminder")
             jobs = active
             try:
                 await self._send(origin, text)
@@ -1022,9 +1201,17 @@ class PersonalTodoPlugin(Star):
                     self.store.acknowledge(job["reminder_id"], int(time.time()))
                 self.store.set_meta(
                     f"focus:{jobs[0]['owner']}:{origin}",
-                    {"ids": [job["task_id"] for job in jobs], "time": int(time.time())},
+                    {"ids": [job["task_id"] for job in visible], "time": int(time.time())},
                 )
-                logger.info("个人待办：提醒投递成功 count=%s", len(jobs))
+                self._record_more_offer(
+                    jobs[0]["owner"], origin, jobs, visible, now, scope="reminders"
+                )
+                logger.info(
+                    "个人待办：提醒投递成功 total=%s shown=%s hidden=%s",
+                    len(jobs),
+                    len(visible),
+                    hidden_count,
+                )
         await self._daily_summary(now)
 
     async def _daily_summary(self, now: int):
@@ -1043,21 +1230,25 @@ class PersonalTodoPlugin(Star):
             return
         rows = self.store.list_tasks(self.owner, limit=500)
         if rows:
-            rows.sort(key=lambda row: (row["due_at"] is None, row["due_at"] or 0, row["id"]))
-            text = f"📋 {day} 未完成待办汇总（{len(rows)}项，最多显示20项）\n\n"
-            text += "\n\n".join(self._line(row, now) for row in rows[:20])
-            text = await self._notification_text(origin, text)
+            days, maximum = self._notification_options()
+            preview = select_preview(rows, now, days, maximum)
+            visible, hidden_count = preview["visible"], len(preview["hidden"])
+            text = await self._notification_text(
+                origin,
+                self._summary_facts(visible, now, hidden_count),
+                tasks=visible,
+                now=now,
+                hidden_count=hidden_count,
+                kind="summary",
+            )
             if self.owner != summary_owner:
                 return
             refreshed = self.store.list_tasks(self.owner, limit=500)
             if refreshed != rows:
-                rows = sorted(
-                    refreshed,
-                    key=lambda row: (row["due_at"] is None, row["due_at"] or 0, row["id"]),
-                )
-                text = f"📋 {day} 未完成待办汇总（{len(rows)}项，最多显示20项）\n\n" + "\n\n".join(
-                    self._line(row, now) for row in rows[:20]
-                )
+                rows = refreshed
+                preview = select_preview(rows, now, days, maximum)
+                visible, hidden_count = preview["visible"], len(preview["hidden"])
+                text = self._brief_fallback(visible, now, hidden_count, "summary")
             if not rows:
                 self.store.set_meta(marker, day)
                 return
@@ -1067,9 +1258,16 @@ class PersonalTodoPlugin(Star):
                 logger.warning("个人待办汇总发送失败：%s", type(exc).__name__)
                 self.store.set_meta(f"summary_retry:{self.owner}", str(now + 300))
                 return
+            self._record_more_offer(summary_owner, origin, rows, visible, now)
         self.store.set_meta(marker, day)
         if rows:
-            logger.info("个人待办：每日汇总投递成功 date=%s count=%s", day, len(rows))
+            logger.info(
+                "个人待办：每日汇总投递成功 date=%s total=%s shown=%s hidden=%s",
+                day,
+                len(rows),
+                len(visible),
+                hidden_count,
+            )
 
     async def _worker(self):
         # Yield during startup so platform connections can finish loading.

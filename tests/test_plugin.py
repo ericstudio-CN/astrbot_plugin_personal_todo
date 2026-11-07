@@ -370,7 +370,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_reports_version_and_auto_default_for_existing_config(self):
         result = await self.command("/待办 状态")
-        self.assertIn("v0.3.1", result)
+        self.assertIn("v0.4.0", result)
         self.assertIn("私聊自动识别：开启", result)
 
     def add_due_task(

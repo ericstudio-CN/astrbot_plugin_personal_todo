@@ -171,15 +171,22 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
             get_conversation=AsyncMock(return_value=types.SimpleNamespace(persona_id="cat")),
         )
         self.context.llm_generate.return_value = types.SimpleNamespace(
-            completion_text="主人，该照顾一下待办啦，喵～"
+            completion_text=json.dumps(
+                {
+                    "opening": "主人，该照顾一下待办啦，喵～",
+                    "items": [{"id": 1, "text": "四级作业明天 23:59截止，记得收个尾哦。"}],
+                    "closing": "",
+                },
+                ensure_ascii=False,
+            )
         )
         task = self.add_due_task(title="四级作业", times=[NOW])
         await self.plugin._tick(NOW)
         text = self.context.send_message.await_args.args[1].text
         self.assertIn("主人，该照顾一下待办啦，喵～", text)
-        self.assertIn("#001", text)
+        self.assertNotIn("#001", text)
         self.assertIn("四级作业", text)
-        self.assertIn("2026-11-06", text)
+        self.assertIn("明天 23:59", text)
         self.assertNotIn("/待办", text)
         self.assertIn("你是猫娘", self.context.llm_generate.await_args.kwargs["system_prompt"])
         focus = self.plugin.store.get_meta("focus:123:qq:private:123")
@@ -197,7 +204,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_completion_during_persona_generation_stops_stale_reminder(self):
         task = self.add_due_task(times=[NOW])
 
-        async def render_then_complete(origin, facts):
+        async def render_then_complete(origin, facts, **kwargs):
             self.plugin.store.finish_task(task["id"], "123", "done", NOW)
             return "开场\n" + facts
 
@@ -208,7 +215,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_owner_change_during_persona_generation_prevents_old_account_delivery(self):
         self.add_due_task(times=[NOW])
 
-        async def change_owner(origin, facts):
+        async def change_owner(origin, facts, **kwargs):
             self.config["owner_qq"] = "456"
             return facts
 

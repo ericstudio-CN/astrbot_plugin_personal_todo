@@ -24,10 +24,28 @@
     "hint": "使用 AstrBot 原生聊天与工具调用，回复继承当前人格及历史。需在当前人格的工具列表允许 personal_todo。关闭可回退独立识别回执模式。"
   },
   "persona_notifications": {
-    "description": "提醒与每日汇总沿用当前人格语气",
+    "description": "提醒正文与每日汇总沿用当前人格语气",
     "type": "bool",
     "default": true,
-    "hint": "仅生成简短提醒开场，任务编号与时间仍由程序提供。模型超时或不可用时照常发送基础提醒。"
+    "hint": "默认由当前人格组织整段提醒，不再开场后拼接长清单。模型不可用时降级为简短事实提醒。"
+  },
+  "fixed_notification_format": {
+    "description": "使用固定清单格式提醒",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭，整段融入人格。开启则使用固定清单；两种格式都只主动展示近期重点。也可聊天说“改成自然提醒”或“使用固定清单”。"
+  },
+  "summary_window_days": {
+    "description": "近期汇总范围（天）",
+    "type": "int",
+    "default": 2,
+    "hint": "1～7。默认展示今明两天到期或最近48小时逾期的未完成事项；更远、较早逾期及无日期事项先收起。"
+  },
+  "summary_max_items": {
+    "description": "一次主动展示的事项上限",
+    "type": "int",
+    "default": 3,
+    "hint": "1～8，默认3件；其余只询问是否展开，不删除任务。"
   },
   "default_lead_minutes": {
     "description": "默认提前提醒分钟数",
